@@ -38,19 +38,19 @@ public class CustomThreadPool implements CustomExecutor {
         }
 
         for (int i = 0; i < corePoolSize; i++) {
-            addWorker();
+            addWorker(i);
         }
     }
 
-    private synchronized void addWorker() {
-        if (activeThreads.get() < maxPoolSize) {
-            int queueIndex = activeThreads.get();
+    private synchronized void addWorker(int queueIndex) {
+        if (activeThreads.get() < maxPoolSize && !isShutdown) {
             BlockingQueue<Runnable> queue = queues.get(queueIndex);
 
             Worker worker = new Worker(queue, queueIndex);
             workers.add(worker);
             activeThreads.incrementAndGet();
             threadFactory.newThread(worker).start();
+            log.debug("[Pool] Added worker for queue #{}", queueIndex);
         }
     }
 
@@ -60,8 +60,12 @@ public class CustomThreadPool implements CustomExecutor {
 
         long idleCount = workers.stream().filter(Worker::isIdle).count();
         if (idleCount < minSpareThreads && activeThreads.get() < maxPoolSize) {
-            log.info("[Pool] Low spare threads ({} < {}), adding worker", idleCount, minSpareThreads);
-            addWorker();
+            for (int i = 0; i < maxPoolSize; i++) {
+                if (!isQueueUsed(i)) {
+                    addWorker(i);
+                    break;
+                }
+            }
         }
 
         int index = (roundRobinCounter.getAndIncrement() & Integer.MAX_VALUE) % queues.size();
@@ -73,11 +77,50 @@ public class CustomThreadPool implements CustomExecutor {
         }
     }
 
+    private boolean isQueueUsed(int queueIndex) {
+        for (Worker w : workers) {
+            if (w.getQueueIndex() == queueIndex && w.isAlive()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @Override
     public <T> Future<T> submit(Callable<T> callable) {
         FutureTask<T> task = new FutureTask<>(callable);
         execute(task);
         return task;
+    }
+
+    @Override
+    public <T> Future<T> submit(Runnable task, T result) {
+        return submit(Executors.callable(task, result));
+    }
+
+    @Override
+    public Future<?> submit(Runnable task) {
+        return submit(Executors.callable(task));
+    }
+
+    @Override
+    public boolean isShutdown() {
+        return isShutdown;
+    }
+
+    @Override
+    public boolean isTerminated() {
+        return isShutdown && activeThreads.get() == 0;
+    }
+
+    @Override
+    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + unit.toMillis(timeout);
+        while (System.currentTimeMillis() < deadline) {
+            if (isTerminated()) return true;
+            Thread.sleep(100);
+        }
+        return isTerminated();
     }
 
     @Override
@@ -87,11 +130,49 @@ public class CustomThreadPool implements CustomExecutor {
     }
 
     @Override
-    public void shutdownNow() {
+    public List<Runnable> shutdownNow() {
         isShutdown = true;
-        queues.forEach(Collection::clear);
-        workers.forEach(Worker::stopForce);
-        log.info("[Pool] ShutdownNow: queues cleared.");
+        List<Runnable> remainingTasks = new ArrayList<>();
+        queues.forEach(queue -> queue.drainTo(remainingTasks));
+        workers.forEach(worker -> {
+            worker.stop();
+            if (worker.thread != null) {
+                worker.thread.interrupt();
+            }
+        });
+        log.info("[Pool] ShutdownNow: {} tasks cleared.", remainingTasks.size());
+        return remainingTasks;
+    }
+
+    @Override
+    public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks) throws InterruptedException {
+        List<Future<T>> futures = new ArrayList<>();
+        for (Callable<T> task : tasks) {
+            futures.add(submit(task));
+        }
+
+        for (Future<T> future : futures) {
+            try {
+                future.get();
+            } catch (ExecutionException e) {
+            }
+        }
+        return futures;
+    }
+
+    @Override
+    public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException {
+        return invokeAll(tasks);
+    }
+
+    @Override
+    public <T> T invokeAny(Collection<? extends Callable<T>> tasks) throws InterruptedException, ExecutionException {
+        throw new UnsupportedOperationException("invokeAny not implemented yet");
+    }
+
+    @Override
+    public <T> T invokeAny(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+        throw new UnsupportedOperationException("invokeAny not implemented yet");
     }
 
     private class Worker implements Runnable {
@@ -107,8 +188,10 @@ public class CustomThreadPool implements CustomExecutor {
         }
 
         public boolean isIdle() { return idle; }
+        public boolean isAlive() { return thread != null && thread.isAlive(); }
+        public int getQueueIndex() { return qIndex; }
 
-        public void stopForce() {
+        public void stop() {
             running = false;
             if (thread != null) thread.interrupt();
         }
@@ -123,7 +206,7 @@ public class CustomThreadPool implements CustomExecutor {
                     Runnable task = myQueue.poll(keepAliveTime, TimeUnit.MILLISECONDS);
 
                     if (task == null) {
-                        if (activeThreads.get() > corePoolSize) {
+                        if (workers.size() > corePoolSize) {
                             log.info("[Worker] {} idle timeout, stopping.", name);
                             break;
                         }
@@ -132,7 +215,11 @@ public class CustomThreadPool implements CustomExecutor {
 
                     idle = false;
                     log.info("[Worker] {} executes task from queue #{}", name, qIndex);
-                    task.run();
+                    try {
+                        task.run();
+                    } catch (Exception e) {
+                        log.error("[Worker] {} task failed: {}", name, e.getMessage());
+                    }
                 }
             } catch (InterruptedException e) {
                 log.info("[Worker] {} interrupted.", name);

@@ -19,6 +19,10 @@ public class LoggingThreadFactory implements ThreadFactory {
     public Thread newThread(Runnable r) {
         String name = prefix + "-worker-" + threadNumber.getAndIncrement();
         Thread t = new Thread(r, name);
+        t.setUncaughtExceptionHandler((thread, throwable) ->
+                log.error("[ThreadFactory] Thread {} died: {}", name, throwable.getMessage())
+        );
+
         log.info("[ThreadFactory] Creating new thread: {}", name);
         return t;
     }
