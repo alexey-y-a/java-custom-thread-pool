@@ -1,0 +1,11 @@
+Параметр,Значение,Время(мс),Пропускная_способность(задач/сек)
+queueSize,100,1238,80775
+queueSize,500,1231,81234
+queueSize,1000,1167,85689
+queueSize,2000,1155,86580
+queueSize,5000,1225,81632
+queueSize,10000,1165,85836
+keepAliveTime,1,1149,87032
+keepAliveTime,5,1124,88967
+keepAliveTime,10,1199,83402
+keepAliveTime,30,1228,81433
